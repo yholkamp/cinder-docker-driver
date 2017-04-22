@@ -300,7 +300,7 @@ func (d CinderDriver) Mount(r volume.Request) volume.Response {
 		return volume.Response{Err: err.Error()}
 	}
 	if vol.ID == "" {
-		log.Error("Volume Not Found!")
+		log.Errorf("Volume ", r.Name, " Not Found!")
 		err := errors.New("Volume Not Found")
 		return volume.Response{Err: err.Error()}
 	}
@@ -320,48 +320,15 @@ func (d CinderDriver) Mount(r volume.Request) volume.Response {
 	if vol.Status != "available" {
 		log.Debugf("Volume info: %+v\n", vol)
 		log.Errorf("Invalid volume status for Mount request, volume is: %s but must be available", vol.Status)
-		err := errors.New("Invalid volume status for Mount request")
+		err := errors.New(fmt.Sprintf("Invalid volume status %s for Mount request of volume %s", vol.Status, vol.ID))
 		return volume.Response{Err: err.Error()}
 	}
+	// TODO(yholkamp): check the reservation response
 	volumeactions.Reserve(d.Client, vol.ID)
 
-	iface := d.Conf.InitiatorIFace
-	netDev, _ := net.InterfaceByName(iface)
-	IPs, _ := net.InterfaceAddrs()
-	log.Debugf("iface: %+v\n Addrs: %+v", netDev, IPs)
+	var device, path string
+	device, path, err = ConnectIscsi(d, hostname, vol.ID)
 
-	log.Debug("Gather up initiator IQNs...")
-	initiator, err := GetInitiatorIqns()
-	if err != nil {
-		log.Error("Failed to retrieve Initiator name!")
-		return volume.Response{Err: err.Error()}
-	}
-	// TODO(ebalduf): Change assumption that we have only one Initiator defined
-	log.Debugf("Value of IPs is=%+v\n", IPs)
-	connectorOpts := volumeactions.ConnectorOpts{
-		IP:        d.Conf.InitiatorIP,
-		Host:      hostname,
-		Initiator: initiator[0],
-		Wwpns:     []string{},
-		Wwnns:     "",
-		Multipath: false,
-		Platform:  "x86",
-		OSType:    "linux",
-	}
-	log.Debug("Issue InitializeConnection...")
-	response := volumeactions.InitializeConnection(d.Client, vol.ID, &connectorOpts)
-	log.Debugf("Response from InitializeConnection: %+v\n", response)
-	data := response.Body.(map[string]interface{})["connection_info"].(map[string]interface{})["data"]
-	var con ConnectorInfo
-	mapstructure.Decode(data, &con)
-	path, device, err := attachVolume(&con, "default")
-	log.Debug("iSCSI connection done")
-	if path == "" || device == "" && err == nil {
-		log.Error("Missing path or device, but err not set?")
-		log.Debug("Path: ", path, " ,Device: ", device)
-		return volume.Response{Err: err.Error()}
-
-	}
 	if err != nil {
 		log.Errorf("Failed to perform iscsi attach of volume %s: %v", r.Name, err)
 		return volume.Response{Err: err.Error()}
@@ -395,6 +362,50 @@ func (d CinderDriver) Mount(r volume.Request) volume.Response {
 	attRes := volumeactions.Attach(d.Client, vol.ID, &attachOpts)
 	log.Debugf("Attach results: %+v", attRes)
 	return volume.Response{Mountpoint: d.Conf.MountPoint + "/" + r.Name}
+}
+
+// Connects a specific volume using iSCSI to the current machine
+func ConnectIscsi(d CinderDriver, hostname string, volumeID string) (device string, path string, err error) {
+	iface := d.Conf.InitiatorIFace
+	netDev, _ := net.InterfaceByName(iface)
+	IPs, _ := net.InterfaceAddrs()
+	log.Debugf("iface: %+v\n Addrs: %+v", netDev, IPs)
+
+	log.Debug("Gather up initiator IQNs...")
+	initiator, initiatorErr := GetInitiatorIqns()
+	if initiatorErr != nil {
+		log.Error("Failed to retrieve Initiator name!")
+		return device, path, initiatorErr
+	}
+
+	// TODO(ebalduf): Change assumption that we have only one Initiator defined
+	log.Debugf("Value of IPs is=%+v\n", IPs)
+
+	connectorOpts := volumeactions.ConnectorOpts{
+		IP:        d.Conf.InitiatorIP,
+		Host:      hostname,
+		Initiator: initiator[0],
+		Wwpns:     []string{},
+		Wwnns:     "",
+		Multipath: false,
+		Platform:  "x86",
+		OSType:    "linux",
+	}
+	// connect over iscsi
+	log.Debug("Issue InitializeConnection...")
+	response := volumeactions.InitializeConnection(d.Client, volumeID, &connectorOpts)
+	log.Debugf("Response from InitializeConnection: %+v\n", response)
+	data := response.Body.(map[string]interface{})["connection_info"].(map[string]interface{})["data"]
+	var con ConnectorInfo
+	mapstructure.Decode(data, &con)
+	path, device, err = attachIscsiVolume(&con, "default")
+	log.Debug("iSCSI connection done")
+	if path == "" || device == "" && err == nil {
+		log.Error("Missing path or device, but err not set?")
+		log.Debug("Path: ", path, " ,Device: ", device)
+		return device, path, err
+	}
+	return device, path, err
 }
 
 func (d CinderDriver) Unmount(r volume.Request) volume.Response {
@@ -517,7 +528,7 @@ func iscsiDetachVolume(tgt string, portal string) (err error) {
 	return
 }
 
-func attachVolume(c *ConnectorInfo, iface string) (path, device string, err error) {
+func attachIscsiVolume(c *ConnectorInfo, iface string) (path, device string, err error) {
 	log.Debugf("Connector is: %+v", c)
 	path = "/dev/disk/by-path/ip-" + c.TgtPortal + "-iscsi-" + c.TgtIQN + "-lun-" + strconv.Itoa(c.TgtLun)
 
