@@ -74,6 +74,11 @@
 			"Rev": "1f02c2bb21f4995dc5afb78314bbb2627fbb32d6"
 		},
 		{
+			"ImportPath": "github.com/rackspace/gophercloud/openstack/compute/v2/extensions/volumeattach",
+			"Comment": "v1.0.0-1005-g1f02c2b",
+			"Rev": "1f02c2bb21f4995dc5afb78314bbb2627fbb32d6"
+		},
+		{
 			"ImportPath": "github.com/rackspace/gophercloud/openstack/identity/v2/tenants",
 			"Comment": "v1.0.0-1005-g1f02c2b",
 			"Rev": "1f02c2bb21f4995dc5afb78314bbb2627fbb32d6"

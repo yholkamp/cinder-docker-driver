@@ -161,6 +161,7 @@ func GetFSType(device string) string {
 	fsType := ""
 	out, err := exec.Command("blkid", device).CombinedOutput()
 	if err != nil {
+		log.Debugf("Could not get filesystem type: %s", err)
 		return fsType
 	}
 

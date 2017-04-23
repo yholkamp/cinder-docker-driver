@@ -10,6 +10,7 @@ import (
 	"github.com/rackspace/gophercloud/openstack"
 	"github.com/rackspace/gophercloud/openstack/blockstorage/v2/extensions/volumeactions"
 	"github.com/rackspace/gophercloud/openstack/blockstorage/v2/volumes"
+	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/volumeattach"
 	"github.com/rackspace/gophercloud/pagination"
 	"io/ioutil"
 	"net"
@@ -29,6 +30,7 @@ type Config struct {
 	InitiatorIFace string //iface to use of iSCSI initiator
 	HostUUID       string
 	SocketGroup    string //Usergroup to use for the plugin socket
+	MountType	   string
 
 	// Cinder credentials
 	Endpoint    string
@@ -44,6 +46,7 @@ type CinderDriver struct {
 	Client *gophercloud.ServiceClient
 	Mutex  *sync.Mutex
 	Conf   *Config
+	ComputeClient *gophercloud.ServiceClient
 }
 
 type ConnectorInfo struct {
@@ -93,6 +96,9 @@ func processConfig(cfg string) (Config, error) {
 		conf.HostUUID, _ = getRootDiskUUID()
 		log.Infof("Set node UUID to: %s", conf.HostUUID)
 	}
+	if conf.MountType == "" || (conf.MountType != "iSCSI" && conf.MountType != "compute") {
+		conf.MountType = "iSCSI"
+	}
 	conf.InitiatorIP, _ = getIPv4ForIFace(conf.InitiatorIFace)
 	log.Infof("Using config file: %s", cfg)
 	log.Infof("Set InitiatorIFace to: %s", conf.InitiatorIFace)
@@ -101,6 +107,7 @@ func processConfig(cfg string) (Config, error) {
 	log.Infof("Set Endpoint to: %s", conf.Endpoint)
 	log.Infof("Set Username to: %s", conf.Username)
 	log.Infof("Set TenantID to: %s", conf.TenantID)
+	log.Infof("Set MountType to: %s", conf.MountType)
 	return conf, nil
 }
 
@@ -114,7 +121,7 @@ func New(cfgFile string) CinderDriver {
 	_, err = os.Lstat(conf.MountPoint)
 	if os.IsNotExist(err) {
 		if err := os.MkdirAll(conf.MountPoint, 0755); err != nil {
-			log.Fatal("Failed to create Mount directory during driver init: %v", err)
+			log.Fatal("Failed to create Mount directory during driver init: ", err)
 		}
 	}
 
@@ -158,10 +165,20 @@ func New(cfgFile string) CinderDriver {
 		log.Fatal("Error initiating gophercloud cinder client: ", err)
 	}
 
+	var computeClient *gophercloud.ServiceClient
+	if conf.MountType == "compute" {
+		// (try to) create a compute client to facilitate attaching a volume using the compute API
+		computeClient, err = openstack.NewComputeV2(providerClient, endpointOpts)
+		if err != nil {
+			log.Fatal("Error initiating gophercloud compute client: ", err)
+		}
+	}
+
 	d := CinderDriver{
 		Conf:   &conf,
 		Mutex:  &sync.Mutex{},
 		Client: client,
+		ComputeClient: computeClient,
 	}
 	return d
 }
@@ -275,7 +292,7 @@ func (d CinderDriver) Remove(r volume.Request) volume.Response {
 	}
 	path := filepath.Join(d.Conf.MountPoint, r.Name)
 	if err := os.Remove(path); err != nil {
-		log.Error("Failed to remove Mount directory: %v", err)
+		log.Error("Failed to remove Mount directory: ", err)
 		return volume.Response{Err: err.Error()}
 	}
 	return volume.Response{}
@@ -323,59 +340,86 @@ func (d CinderDriver) Mount(r volume.Request) volume.Response {
 		err := errors.New(fmt.Sprintf("Invalid volume status %s for Mount request of volume %s", vol.Status, vol.ID))
 		return volume.Response{Err: err.Error()}
 	}
-	// TODO(yholkamp): check the reservation response
-	volumeactions.Reserve(d.Client, vol.ID)
-
-	var device, path string
-	device, path, err = ConnectIscsi(d, hostname, vol.ID)
-
+	var path string
+	if d.Conf.MountType == "iSCSI" {
+		// connect the volume over iSCSI
+		path, err = connectIscsi(d, hostname, vol.ID, r.Name)
+	} else {
+		// connect the provided volume using the OpenStack API
+		path, err = connectWithComputeAPI(d, vol.ID, r.Name)
+	}
 	if err != nil {
-		log.Errorf("Failed to perform iscsi attach of volume %s: %v", r.Name, err)
+		log.Errorf("Failed to attach volume: %s", err.Error())
 		return volume.Response{Err: err.Error()}
 	}
+	return volume.Response{Mountpoint: path}
+}
 
+// Waits for the presence of the provided device, formats the partition if necessary and mounts it
+func formatAndMount(device string, mountPoint string, name string) (err error) {
+	if device == "" {
+		return errors.New("Empty device name provided")
+	}
+	// wait until the device exists on the system
+	log.Debugf("Waiting until %s is available", device)
+	gophercloud.WaitFor(120, func() (bool, error) {
+		_, err := os.Stat(device)
+		if err == nil { return true, nil }
+		if os.IsNotExist(err) { return false, nil }
+		return true, err
+	})
 	if GetFSType(device) == "" {
 		//TODO(jdg): Enable selection of *other* fs types
 		log.Debugf("Formatting device")
 		err := FormatVolume(device, "ext4")
 		if err != nil {
-			err := errors.New("Failed to format device")
-			log.Error(err)
-			return volume.Response{Err: err.Error()}
+			return errors.New("Failed to format device")
 		}
 	}
-	if mountErr := Mount(device, d.Conf.MountPoint+"/"+r.Name); mountErr != nil {
-		err := errors.New("Problem mounting docker volume ")
-		log.Error(err)
-		return volume.Response{Err: err.Error()}
+	if err := Mount(device, mountPoint + "/" + name); err != nil {
+		return errors.New(fmt.Sprintf("Problem mounting docker volume: %s", err))
 	}
 
-	path = filepath.Join(d.Conf.MountPoint, r.Name)
-	// NOTE(jdg): Cinder will barf if you provide both Instance and HostName
-	// which is kinda silly... but it is what it is
-	attachOpts := volumeactions.AttachOpts{
-		MountPoint:   path,
-		InstanceUUID: d.Conf.HostUUID,
-		HostName:     "",
-		Mode:         "rw"}
-	log.Debug("Call gophercloud Attach...")
-	attRes := volumeactions.Attach(d.Client, vol.ID, &attachOpts)
-	log.Debugf("Attach results: %+v", attRes)
-	return volume.Response{Mountpoint: d.Conf.MountPoint + "/" + r.Name}
+	return nil
+}
+
+// Connects a volume using the OpenStack compute API
+// it returns the device and path the volume was mounted at or an error
+func connectWithComputeAPI(d CinderDriver, volumeId string, volumeName string) (path string, err error) {
+	// connect drive to our compute instance
+	log.Debugf("Attaching volume %s to server %s", volumeId, d.Conf.HostUUID)
+
+	createOpts := volumeattach.CreateOpts{VolumeID: volumeId}
+	result, err := volumeattach.Create(d.ComputeClient, d.Conf.HostUUID, createOpts).Extract()
+	if err != nil {
+		log.Errorf("Received an error while attaching volume %s to server %s: %s", volumeId, d.Conf.HostUUID, err)
+		return path, err
+	}
+
+	path = filepath.Join(d.Conf.MountPoint, volumeName)
+	device := result.Device
+	log.Debugf("Attached disk %s as %s to server %s", volumeName, device, d.Conf.HostUUID)
+
+	if err := formatAndMount(device, d.Conf.MountPoint, volumeName); err != nil {
+		log.Error(err)
+		return path, err
+	}
+	return path, err
 }
 
 // Connects a specific volume using iSCSI to the current machine
-func ConnectIscsi(d CinderDriver, hostname string, volumeID string) (device string, path string, err error) {
+// it returns the name of the device this volume was connected as, the path it can be found at or an error.
+func connectIscsi(d CinderDriver, hostname string, volumeID string, volumeName string) (path string, err error) {
+	volumeactions.Reserve(d.Client, volumeID)
 	iface := d.Conf.InitiatorIFace
 	netDev, _ := net.InterfaceByName(iface)
 	IPs, _ := net.InterfaceAddrs()
 	log.Debugf("iface: %+v\n Addrs: %+v", netDev, IPs)
-
 	log.Debug("Gather up initiator IQNs...")
 	initiator, initiatorErr := GetInitiatorIqns()
 	if initiatorErr != nil {
 		log.Error("Failed to retrieve Initiator name!")
-		return device, path, initiatorErr
+		return path, initiatorErr
 	}
 
 	// TODO(ebalduf): Change assumption that we have only one Initiator defined
@@ -397,15 +441,32 @@ func ConnectIscsi(d CinderDriver, hostname string, volumeID string) (device stri
 	log.Debugf("Response from InitializeConnection: %+v\n", response)
 	data := response.Body.(map[string]interface{})["connection_info"].(map[string]interface{})["data"]
 	var con ConnectorInfo
+	var device string
 	mapstructure.Decode(data, &con)
 	path, device, err = attachIscsiVolume(&con, "default")
 	log.Debug("iSCSI connection done")
 	if path == "" || device == "" && err == nil {
 		log.Error("Missing path or device, but err not set?")
 		log.Debug("Path: ", path, " ,Device: ", device)
-		return device, path, err
+		return path, err
 	}
-	return device, path, err
+
+	if err := formatAndMount(device, d.Conf.MountPoint, volumeName); err != nil {
+		log.Error(err)
+		return path, err
+	}
+
+	path = filepath.Join(d.Conf.MountPoint, volumeName)
+	// NOTE(jdg): Cinder will barf if you provide both Instance and HostName
+	// which is kinda silly... but it is what it is
+	attachOpts := volumeactions.AttachOpts{
+		MountPoint:   path,
+		InstanceUUID: d.Conf.HostUUID,
+	}
+	log.Debug("Call gophercloud Attach...")
+	attRes := volumeactions.Attach(d.Client, volumeID, &attachOpts)
+	log.Debugf("Attach results: %+v", attRes)
+	return path, err
 }
 
 func (d CinderDriver) Unmount(r volume.Request) volume.Response {
@@ -440,39 +501,40 @@ func (d CinderDriver) Unmount(r volume.Request) volume.Response {
 
 	// NOTE(jdg): Don't rely on things like `df --output=source mounpoint`
 	// that's no good for error situations.
-
-	tgt, portal := getTgtInfo(vol)
-	iscsiDetachVolume(tgt, portal)
-	log.Debug("Terminate Connection")
-	iface := d.Conf.InitiatorIFace
-	netDev, _ := net.InterfaceByName(iface)
-	IPs, _ := net.InterfaceAddrs()
-	log.Debugf("iface: %+v\n Addrs: %+v", netDev, IPs)
-	initiators, err := GetInitiatorIqns()
-	if err != nil {
-		log.Error("Failed to retrieve Initiator name!")
-		return volume.Response{Err: err.Error()}
+	if d.Conf.MountType == "iSCSI" {
+		tgt, portal := getTgtInfo(vol)
+		iscsiDetachVolume(tgt, portal)
+		log.Debug("Terminate Connection")
+		iface := d.Conf.InitiatorIFace
+		netDev, _ := net.InterfaceByName(iface)
+		IPs, _ := net.InterfaceAddrs()
+		log.Debugf("iface: %+v\n Addrs: %+v", netDev, IPs)
+		initiators, err := GetInitiatorIqns()
+		if err != nil {
+			log.Error("Failed to retrieve Initiator name!")
+			return volume.Response{Err: err.Error()}
+		}
+		hostname, _ := os.Hostname()
+		// TODO(ebalduf): Change assumption that we have only one Initiator defined
+		// TODO(jdg): For now we're only supporting linux, but in the future we'll
+		// need to get rid of the hard coded Platform/OSType and fix this up for
+		// things like say Windows
+		log.Debugf("IPs=%+v\n", IPs)
+		connectorOpts := volumeactions.ConnectorOpts{
+			IP:        d.Conf.InitiatorIP,
+			Host:      hostname,
+			Initiator: initiators[0],
+			Wwpns:     []string{},
+			Wwnns:     "",
+			Multipath: false,
+			Platform:  "x86",
+			OSType:    "linux",
+		}
+		log.Debugf("Unreserve volume: %s", vol.ID)
+		volumeactions.Unreserve(d.Client, vol.ID)
+		log.Debugf("Terminate connection for volume: %s", vol.ID)
+		volumeactions.TerminateConnection(d.Client, vol.ID, &connectorOpts)
 	}
-	hostname, _ := os.Hostname()
-	// TODO(ebalduf): Change assumption that we have only one Initiator defined
-	// TODO(jdg): For now we're only supporting linux, but in the future we'll
-	// need to get rid of the hard coded Platform/OSType and fix this up for
-	// things like say Windows
-	log.Debugf("IPs=%+v\n", IPs)
-	connectorOpts := volumeactions.ConnectorOpts{
-		IP:        d.Conf.InitiatorIP,
-		Host:      hostname,
-		Initiator: initiators[0],
-		Wwpns:     []string{},
-		Wwnns:     "",
-		Multipath: false,
-		Platform:  "x86",
-		OSType:    "linux",
-	}
-	log.Debugf("Unreserve volume: %s", vol.ID)
-	volumeactions.Unreserve(d.Client, vol.ID)
-	log.Debugf("Terminate connection for volume: %s", vol.ID)
-	volumeactions.TerminateConnection(d.Client, vol.ID, &connectorOpts)
 	log.Debugf("Detach volume: %s", vol.ID)
 	volumeactions.Detach(d.Client, vol.ID)
 	return volume.Response{}

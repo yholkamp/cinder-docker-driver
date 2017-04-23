@@ -57,7 +57,7 @@ Configuration options are stored in json format in config.json, the minimum requ
 - Password
 - TenantID
 
-### Additonal/Optional Config
+### Additional/Optional Config
 
 - DefaultVolSz (1 GiB)
 - MountPoint (/var/lib/cinder/mount)
@@ -65,6 +65,7 @@ Configuration options are stored in json format in config.json, the minimum requ
 - HostUUID (root disk UUID)
 - InitiatorIP (default interface IP)
 - Region (defaults to "RegionOne")
+- MountType (defaults to "iSCSI", set to "compute" to connect the volume using the OpenStack compute API, eliminating the need for iSCSI functionality)
 
 Example config with additional options:
 
@@ -78,9 +79,12 @@ Example config with additional options:
   "MountPoint": "/mnt/cvols",
   "InitiatorIFace": "/dev/eth4",
   "HostUUID": "219b0670-a214-4281-8424-5bb3be109ddd",
-  "InitiatorIP": "192.168.4.201"
+  "InitiatorIP": "192.168.4.201",
+  "Region": "US-East1",
+  "MountType": "compute"
 }
 ```
+
 ## Start the daemon
 If you want to just launch the driver daemon as root (or sudo):
 
