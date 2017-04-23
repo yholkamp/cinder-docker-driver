@@ -25,7 +25,7 @@ Requires=cinder-docker-driver.service
 
 [Service]
 TimeoutStartSec=0
-ExecStart=/usr/bin/cinder-docker-driver &
+ExecStart=$BIN_DIR/$BIN_NAME &
 
 [Install]
 WantedBy=docker.service" >/etc/systemd/system/cinder-docker-driver.service
@@ -36,3 +36,6 @@ systemctl enable cinder-docker-driver
 }
 
 do_install
+
+echo "Cinder docker driver installed, your configuration file is located at:"
+echo "/var/lib/cinder/dockerdriver/config.json"
