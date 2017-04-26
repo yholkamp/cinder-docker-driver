@@ -518,6 +518,10 @@ func iscsiDetachVolume(tgt string, portal string) (err error) {
 }
 
 func attachVolume(c *ConnectorInfo, iface string) (path, device string, err error) {
+	if c.TgtIQN == "" {
+		log.Error("TgtIQN is empty, aborting")
+		return path, device, errors.New("TgtIQN is empty, aborting")
+	}
 	log.Debugf("Connector is: %+v", c)
 	path = "/dev/disk/by-path/ip-" + c.TgtPortal + "-iscsi-" + c.TgtIQN + "-lun-" + strconv.Itoa(c.TgtLun)
 
